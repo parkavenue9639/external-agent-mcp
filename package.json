@@ -1,0 +1,17 @@
+{
+  "name": "external-agent-mcp",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Local MCP bridge for invoking external CLI coding agents in read-only mode.",
+  "bin": {
+    "external-agent-mcp": "./src/server.mjs"
+  },
+  "scripts": {
+    "start": "node ./src/server.mjs",
+    "test": "node ./test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
