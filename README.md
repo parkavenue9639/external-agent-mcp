@@ -1,49 +1,117 @@
 # external-agent-mcp
 
-Local stdio MCP bridge that lets Codex call installed external CLI coding agents
-for bounded read-only code analysis and deterministic quality fixes.
-
-This first version supports:
-
-- Cursor Agent via `/usr/local/bin/cursor agent --print --mode=plan`
-- Gemini CLI via `/opt/homebrew/bin/gemini --prompt ... --approval-mode plan`
-- Claude Code via `/opt/homebrew/bin/claude --print --permission-mode plan`
+Local stdio MCP runtime that lets Codex delegate work to installed external CLI
+coding agents. Codex starts asynchronous jobs through one MCP call, then polls
+for status, free-form results, logs, and sandbox patch artifacts.
 
 The server is dependency-free Node.js and speaks MCP over line-delimited
 JSON-RPC on stdio.
 
+## Providers
+
+Initial provider adapters:
+
+- Cursor Agent via `/usr/local/bin/cursor agent --print`
+- Gemini CLI via `/opt/homebrew/bin/gemini --prompt ...`
+- Claude Code via `/opt/homebrew/bin/claude --print`
+
+Model selection is caller-controlled with the `model` argument. The MCP server
+does not hardcode routing logic such as "simple task uses X, complex task uses
+Y".
+
 ## Tools
 
-### `analyze_code`
+### `delegate_tasks`
 
-Runs one external provider against a repository path and returns a structured
-JSON payload containing command metadata, exit status, bounded stdout, and
-bounded stderr.
+Creates one or more async jobs.
 
 Required arguments:
 
+- `repo_path`: absolute repository/workspace path
 - `provider`: `cursor`, `gemini`, or `claude`
-- `repo_path`: absolute path to the repository/workspace
-- `task`: concrete read-only code analysis task
+- `tasks`: array of task strings or task objects
 
-Optional arguments:
+Common optional arguments:
 
-- `files`: focus files; repo-relative or absolute paths under `repo_path`
-- `extra_context`: additional instructions
+- `mode`: `analysis` or `sandbox_patch`; defaults to `analysis`
 - `model`: provider-specific model override
+- `files`: focus files under `repo_path`
+- `extra_context`: additional background
 - `timeout_sec`: defaults to `600`, capped at `1800`
 - `max_output_chars`: defaults to `30000`, capped at `100000`
-- `include_stderr`: defaults to `true`
+- `base_ref`: git ref for `sandbox_patch`; defaults to `HEAD`
+
+Task objects may override `provider`, `model`, `mode`, `files`,
+`extra_context`, `timeout_sec`, `max_output_chars`, and `base_ref`.
+
+### `job_status`
+
+Returns job lifecycle state and stdout/stderr tails. Status values are:
+
+- `queued`
+- `running`
+- `succeeded`
+- `failed`
+- `timed_out`
+- `cancelled`
+- `orphaned`
+
+If no `job_id` or `job_ids` are supplied, recent jobs are returned.
+
+### `job_result`
+
+Returns the external agent's free-form result text plus MCP-managed metadata:
+
+- command metadata and exit status
+- stdout/stderr log paths
+- `result.md`
+- `diff.patch`, `diff.stat`, and changed files for `sandbox_patch`
+
+### `search_jobs`
+
+Searches historical jobs by lightweight metadata and previews. This is the
+stable history lookup interface; full text and patch artifacts should still be
+read with `job_result`.
+
+Supported filters:
+
+- `repo_path`: exact repository path
+- `provider`: `cursor`, `gemini`, or `claude`
+- `model`: exact model string
+- `mode`: `analysis` or `sandbox_patch`
+- `status`: any of `queued`, `running`, `succeeded`, `failed`, `timed_out`,
+  `cancelled`, or `orphaned`
+- `created_after` / `created_before`: ISO timestamps
+- `query`: case-insensitive substring search over title, task, result preview,
+  paths, provider/model/mode, and focused files
+- `limit`: defaults to `20`, capped at `100`
+- `cursor`: opaque pagination cursor from a previous response
+
+The response returns job summaries, previews, hashes, and artifact paths. It
+does not return large stdout, stderr, result, or patch bodies.
+
+### `cancel_jobs`
+
+Cancels queued or running jobs.
+
+### `cleanup_jobs`
+
+Removes terminal job logs/artifacts and associated sandbox worktrees. Use
+`force: true` only when cleaning non-terminal jobs intentionally.
 
 ### `agent_status`
 
-Checks configured provider binaries with version commands. It does not run an
-analysis prompt.
+Checks provider binaries and reports capability metadata:
+
+- `supports_analysis`
+- `supports_sandbox_patch`
+- `supports_models`
+- `safe_write_mode`
 
 ### `quality_fix`
 
-Runs allow-listed deterministic quality commands over a bounded file set.
-This is intended for mechanical fixes that should not spend LLM tokens.
+Runs allow-listed deterministic quality commands over a bounded file set. This
+path is for mechanical fixes and does not spend LLM agent tokens.
 
 Default commands:
 
@@ -56,26 +124,66 @@ Additional commands:
 - `ruff_unsafe_fix`: `ruff check --fix --unsafe-fixes <files>`; requires
   `allow_unsafe_fixes: true`
 
-Required arguments:
+## Job Storage
 
-- `repo_path`: absolute path to the git repository/workspace
+Jobs are persisted under:
 
-Optional arguments:
+```text
+~/.cache/external-agent-mcp/jobs
+```
 
-- `files`: repo-relative or absolute files to fix; required unless
-  `allow_repo_wide` is true
-- `commands`: defaults to `["ruff_format", "ruff_safe_fix"]`
-- `allow_repo_wide`: allows target `.`; defaults to `false`
-- `allow_unsafe_fixes`: required for `ruff_unsafe_fix`; defaults to `false`
-- `timeout_sec`: per-command timeout; defaults to `120`, capped at `900`
-- `max_output_chars`: per-command output cap; defaults to `30000`
-- `max_changed_files`: maximum newly dirty files; defaults to `20`
-- `include_diff_stat`: defaults to `true`
+Override with:
 
-The result includes command outputs, before/after git status paths, newly dirty
-files, out-of-scope newly dirty files, safety errors, and optional diff stat.
+```text
+EXTERNAL_AGENT_JOB_ROOT=/path/to/jobs
+```
 
-## Codex config
+Each job directory contains:
+
+- `job.json`
+- `events.jsonl`
+- `stdout.log`
+- `stderr.log`
+- `result.md`
+- `diff.patch`
+- `diff.stat`
+
+If the MCP server restarts, non-terminal jobs from the previous process are
+marked `orphaned`. Completed job artifacts remain readable.
+
+The current storage implementation is `FileJobStore`: metadata is read from
+`job.json`, events are appended to `events.jsonl`, and large artifacts remain as
+plain files. `search_jobs` is intentionally defined above this storage layer so
+a future SQLite-backed index can replace the file scan without changing the MCP
+tool contract.
+
+New jobs include stable metadata for history and future caching:
+
+- `schema_version`
+- `repo_head`
+- `task_hash`
+- `prompt_hash`
+- `duration_ms`
+- `result_preview`
+
+## Sandbox Patch Mode
+
+`mode: "sandbox_patch"` requires a git repository. The server creates an
+isolated git worktree under the job directory, runs the external agent there,
+and then captures `git diff --binary` and `git diff --stat`.
+
+The original repository is not modified by agent writes.
+
+Provider write policy is conservative:
+
+- Cursor sandbox patch is marked experimental and is launched without
+  `--force` or `--yolo`.
+- Gemini uses `--approval-mode auto_edit`.
+- Claude uses `--permission-mode acceptEdits` with a restricted tool list.
+- The server rejects adapter commands that include `--force`, `--yolo`, or
+  bypass-permission flags.
+
+## Codex Config
 
 Add this to `~/.codex/config.toml` or a trusted project `.codex/config.toml`:
 
@@ -87,73 +195,82 @@ startup_timeout_sec = 10
 tool_timeout_sec = 900
 
 [mcp_servers.external_agent.env]
-EXTERNAL_AGENT_ALLOWED_ROOTS = "/Users/luchong/Desktop:/Users/luchong/OpenSourceProject"
-```
-
-Optional binary overrides:
-
-```toml
-[mcp_servers.external_agent.env]
 CURSOR_AGENT_BIN = "/usr/local/bin/cursor"
 GEMINI_BIN = "/opt/homebrew/bin/gemini"
 CLAUDE_BIN = "/opt/homebrew/bin/claude"
 RUFF_BIN = "ruff"
 EXTERNAL_AGENT_ALLOWED_ROOTS = "/Users/luchong/Desktop:/Users/luchong/OpenSourceProject"
+EXTERNAL_AGENT_MAX_CONCURRENCY = "2"
 ```
 
 After changing MCP config, refresh/restart Codex or start a new thread so the
 new tool surface is loaded.
 
-## Manual test
+## Examples
 
-```bash
-npm test
-```
-
-## Example tool arguments
-
-### External analysis
+### Parallel Analysis
 
 ```json
 {
-  "provider": "gemini",
+  "provider": "cursor",
+  "model": "composer-2.5",
   "repo_path": "/Users/luchong/Desktop/Agnes_Core",
-  "task": "Analyze the stream cancellation implementation. Focus on correctness, structured error propagation, and missing tests.",
-  "files": [
-    "kw-agent-service/path/to/file.py"
+  "mode": "analysis",
+  "tasks": [
+    "Map the agent stream cancellation call path. Return concise findings with file paths.",
+    "Audit prompt/skill dispatch boundaries. Return risks and missing tests."
   ],
-  "timeout_sec": 900,
-  "max_output_chars": 40000
+  "timeout_sec": 900
 }
 ```
 
-### Deterministic Ruff fix
+### Sandbox Patch
+
+```json
+{
+  "provider": "claude",
+  "repo_path": "/Users/luchong/Desktop/Agnes_Core",
+  "mode": "sandbox_patch",
+  "tasks": [
+    {
+      "task": "Fix the focused Ruff SIM102 issue and summarize the patch.",
+      "files": ["services/example/path.py"]
+    }
+  ]
+}
+```
+
+Then call `job_status` until terminal and `job_result` to inspect the free-form
+result, logs, and patch path.
+
+### Search History
 
 ```json
 {
   "repo_path": "/Users/luchong/Desktop/Agnes_Core",
-  "files": [
-    "kw-agent-service/path/to/file.py"
-  ],
-  "commands": [
-    "ruff_format",
-    "ruff_safe_fix"
-  ],
+  "provider": "cursor",
+  "model": "composer-2.5",
+  "mode": "analysis",
+  "status": ["succeeded", "failed"],
+  "query": "stream cancellation",
+  "limit": 20
+}
+```
+
+### Deterministic Ruff Fix
+
+```json
+{
+  "repo_path": "/Users/luchong/Desktop/Agnes_Core",
+  "files": ["services/example/path.py"],
+  "commands": ["ruff_format", "ruff_safe_fix"],
   "timeout_sec": 120,
   "max_changed_files": 10
 }
 ```
 
-## Safety notes
+## Manual Test
 
-- The bridge uses `child_process.spawn` with argv arrays, not shell command
-  strings.
-- Read-only provider modes are hardcoded for normal analysis calls.
-- `quality_fix` requires a git repository so it can report before/after changed
-  files and flag unexpected newly dirty files.
-- `quality_fix` requires explicit files by default; repo-wide `.` runs require
-  `allow_repo_wide: true`.
-- `EXTERNAL_AGENT_ALLOWED_ROOTS` is strongly recommended. If it is unset, the
-  bridge allows any existing absolute directory passed by the MCP caller.
-- The bridge does not pass `--yolo`, `--force`, or equivalent write-friendly
-  flags.
+```bash
+npm test
+```

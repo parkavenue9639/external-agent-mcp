@@ -1,9 +1,9 @@
 {
   "name": "external-agent-mcp",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Local MCP bridge for invoking external CLI coding agents in read-only mode.",
+  "description": "Local MCP runtime for delegating asynchronous jobs to external CLI coding agents.",
   "bin": {
     "external-agent-mcp": "./src/server.mjs"
   },
