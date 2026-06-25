@@ -29,6 +29,8 @@ try {
   const patchJobId = await assertSandboxPatchJob(client);
   await assertSearchJobs(client, analysisJobId, patchJobId);
   await assertParallelQueue(client);
+  await assertConcurrentServerDoesNotOrphanLiveJob(client);
+  await assertCrossServerCancel(client);
   await assertCancel(client);
   await assertTimeout(client);
   await assertQualityFix(client);
@@ -347,6 +349,54 @@ async function assertParallelQueue(server) {
     const status = await waitForTerminal(server, id);
     assert.equal(status.status, "succeeded");
   }
+}
+
+async function assertConcurrentServerDoesNotOrphanLiveJob(server) {
+  const payload = await callTool(server, "delegate_tasks", {
+    provider: "cursor",
+    repo_path: repoPath,
+    mode: "analysis",
+    tasks: ["WAIT_1200 LIVE_OWNER"],
+    timeout_sec: 5,
+  });
+  const jobId = payload.jobs[0].job_id;
+  await waitForStatus(server, jobId, "running");
+
+  const concurrent = startServer();
+  try {
+    await initialize(concurrent);
+    const status = await callTool(concurrent, "job_status", { job_id: jobId, tail_chars: 0 });
+    assert.equal(status.jobs[0].status, "running");
+  } finally {
+    await stopServer(concurrent);
+  }
+
+  const terminal = await waitForTerminal(server, jobId, 5000);
+  assert.equal(terminal.status, "succeeded");
+}
+
+async function assertCrossServerCancel(server) {
+  const payload = await callTool(server, "delegate_tasks", {
+    provider: "cursor",
+    repo_path: repoPath,
+    mode: "analysis",
+    tasks: ["WAIT_3000 CROSS_SERVER_CANCEL"],
+    timeout_sec: 10,
+  });
+  const jobId = payload.jobs[0].job_id;
+  await waitForStatus(server, jobId, "running");
+
+  const concurrent = startServer();
+  try {
+    await initialize(concurrent);
+    const cancelled = await callTool(concurrent, "cancel_jobs", { job_ids: [jobId] });
+    assert.equal(cancelled.jobs[0].cancelled, true);
+  } finally {
+    await stopServer(concurrent);
+  }
+
+  const status = await waitForTerminal(server, jobId, 5000);
+  assert.equal(status.status, "cancelled");
 }
 
 async function assertCancel(server) {
