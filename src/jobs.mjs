@@ -47,14 +47,18 @@ export function initializeJobs() {
     return;
   }
   jobStore.initialize();
+  const now = new Date().toISOString();
   for (const jobId of listJobIds()) {
     try {
       const job = readJob(jobId);
       if (job.status === "queued" || job.status === "running") {
+        if (isJobAttachedToLiveProcess(job)) {
+          continue;
+        }
         updateJob(jobId, {
           status: "orphaned",
-          finished_at: new Date().toISOString(),
-          orphaned_at: new Date().toISOString(),
+          finished_at: now,
+          orphaned_at: now,
           error: "MCP server restarted while job was not terminal",
         });
         appendEvent(jobId, "orphaned", { reason: "server_restart" });
@@ -309,6 +313,17 @@ export async function cancelJobs(args) {
     }
     const active = activeJobs.get(jobId);
     if (!active) {
+      if (isPidAlive(job.pid)) {
+        updateJob(jobId, {
+          status: "cancelled",
+          finished_at: new Date().toISOString(),
+          error: "cancel requested",
+        });
+        appendEvent(jobId, "cancel_requested", { pid: job.pid, phase: "external_process" });
+        killPid(job.pid, "SIGTERM");
+        results.push({ job_id: jobId, status: "cancelled", cancelled: true });
+        continue;
+      }
       updateJob(jobId, {
         status: "orphaned",
         finished_at: new Date().toISOString(),
@@ -493,6 +508,7 @@ function createJob({
     files: files.map((file) => path.relative(repoPath, file)),
     model: model ?? null,
     extra_context: extraContext ?? null,
+    owner_pid: process.pid,
     timeout_sec: timeoutSec,
     max_output_chars: maxOutputChars,
     job_dir: directory,
@@ -544,6 +560,7 @@ async function startJob(jobId) {
     job = updateJob(jobId, {
       status: "running",
       started_at: startedAt,
+      runner_pid: process.pid,
       workspace_path: workspacePath,
       worktree_path: job.mode === "sandbox_patch" ? workspacePath : null,
     });
@@ -762,6 +779,39 @@ function saveJob(job) {
 
 function appendEvent(jobId, type, data) {
   jobStore.appendEvent(jobId, type, data);
+}
+
+function isJobAttachedToLiveProcess(job) {
+  if (job.status === "queued") {
+    return isPidAlive(job.owner_pid);
+  }
+  if (job.status === "running") {
+    if (job.runner_pid != null) {
+      return isPidAlive(job.runner_pid);
+    }
+    return isPidAlive(job.pid);
+  }
+  return false;
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killPid(pid, signal) {
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // The process may have exited between the liveness check and the kill.
+  }
 }
 
 function jobDir(jobId) {
