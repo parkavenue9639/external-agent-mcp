@@ -226,6 +226,7 @@ export async function jobStatus(args) {
         signal: job.signal ?? null,
         timed_out: job.timed_out ?? false,
         error: job.error ?? null,
+        activity: jobActivity(job),
         stdout_tail: tailChars > 0 ? readTail(job.stdout_path, tailChars).text : "",
         stderr_tail: tailChars > 0 ? readTail(job.stderr_path, tailChars).text : "",
       };
@@ -553,6 +554,7 @@ async function startJob(jobId) {
   const provider = PROVIDERS[job.provider];
   const binary = resolveProviderBinary(provider);
   const startedAt = new Date().toISOString();
+  let heartbeatTimer = null;
   appendEvent(jobId, "starting", {});
 
   try {
@@ -601,6 +603,19 @@ async function startJob(jobId) {
       },
     });
 
+    heartbeatTimer = setInterval(() => {
+      const latest = readJob(jobId);
+      if (latest.status !== "running") {
+        return;
+      }
+      appendEvent(jobId, "heartbeat", {
+        elapsed_ms: elapsedMs(latest.started_at, null),
+        stdout_bytes: fileSize(latest.stdout_path),
+        stderr_bytes: fileSize(latest.stderr_path),
+      });
+    }, heartbeatIntervalMs());
+    heartbeatTimer.unref?.();
+
     const result = await runPromise;
     activeJobs.delete(jobId);
     job = readJob(jobId);
@@ -613,11 +628,7 @@ async function startJob(jobId) {
           ? "succeeded"
           : "failed";
 
-    if (fs.existsSync(job.stdout_path)) {
-      fs.copyFileSync(job.stdout_path, job.result_path);
-    } else {
-      fs.writeFileSync(job.result_path, "");
-    }
+    writeResultArtifact(job, provider);
 
     let patchTruncated = false;
     let diffStatTruncated = false;
@@ -655,6 +666,9 @@ async function startJob(jobId) {
     });
     appendEvent(jobId, status, { error: error.message });
   } finally {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+    }
     scheduleQueue();
   }
 }
@@ -761,6 +775,23 @@ function projectJobSummary(job) {
   };
 }
 
+function jobActivity(job) {
+  const stdoutBytes = fileSize(job.stdout_path);
+  const stderrBytes = fileSize(job.stderr_path);
+  const resultBytes = fileSize(job.result_path);
+  const lastEvent = readLastEvent(job.events_path);
+  return {
+    elapsed_ms: job.duration_ms ?? elapsedMs(job.started_at, job.finished_at),
+    stdout_bytes: stdoutBytes,
+    stderr_bytes: stderrBytes,
+    result_bytes: resultBytes,
+    no_output_yet: stdoutBytes === 0 && stderrBytes === 0,
+    last_event_at: lastEvent?.ts ?? null,
+    last_event_type: lastEvent?.type ?? null,
+    last_output_at: latestOutputMtime(job.stdout_path, job.stderr_path),
+  };
+}
+
 function listJobIds() {
   return jobStore.listJobIds();
 }
@@ -812,6 +843,144 @@ function killPid(pid, signal) {
   } catch {
     // The process may have exited between the liveness check and the kill.
   }
+}
+
+function writeResultArtifact(job, provider) {
+  if (!fs.existsSync(job.stdout_path)) {
+    fs.writeFileSync(job.result_path, "");
+    return;
+  }
+
+  if (provider.outputFormat === "claude_stream_json") {
+    const result = extractClaudeStreamResult(job.stdout_path);
+    fs.writeFileSync(job.result_path, result);
+    return;
+  }
+
+  fs.copyFileSync(job.stdout_path, job.result_path);
+}
+
+function extractClaudeStreamResult(stdoutPath) {
+  const raw = fs.readFileSync(stdoutPath, "utf8");
+  const assistantTexts = [];
+  let finalResult = "";
+
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    if (event.type === "result" && typeof event.result === "string") {
+      finalResult = event.result;
+      continue;
+    }
+
+    const text = [
+      ...textFromContent(event.message?.content),
+      ...textFromContent(event.content),
+      textFromDelta(event.delta),
+    ]
+      .filter(Boolean)
+      .join("");
+    if (text) {
+      assistantTexts.push(text);
+    }
+  }
+
+  const extracted = (finalResult || assistantTexts.join("\n")).trim();
+  return extracted || raw;
+}
+
+function textFromContent(content) {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  return content
+    .map((block) => {
+      if (typeof block === "string") {
+        return block;
+      }
+      if (block?.type === "text" && typeof block.text === "string") {
+        return block.text;
+      }
+      if (typeof block?.text === "string") {
+        return block.text;
+      }
+      return textFromDelta(block?.delta);
+    })
+    .filter(Boolean);
+}
+
+function textFromDelta(delta) {
+  if (typeof delta?.text === "string") {
+    return delta.text;
+  }
+  return "";
+}
+
+function readLastEvent(eventsPath) {
+  if (!fs.existsSync(eventsPath)) {
+    return null;
+  }
+  const text = readTextLimited(eventsPath, 20000).text.trim();
+  if (!text) {
+    return null;
+  }
+  const line = text.split(/\r?\n/).at(-1);
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+function fileSize(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return 0;
+  }
+}
+
+function latestOutputMtime(...filePaths) {
+  let latest = 0;
+  for (const filePath of filePaths) {
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.size > 0) {
+        latest = Math.max(latest, stat.mtimeMs);
+      }
+    } catch {
+      // Missing output files simply mean there has been no output yet.
+    }
+  }
+  return latest > 0 ? new Date(latest).toISOString() : null;
+}
+
+function elapsedMs(startedAt, finishedAt) {
+  if (!startedAt) {
+    return null;
+  }
+  const started = Date.parse(startedAt);
+  const finished = finishedAt ? Date.parse(finishedAt) : Date.now();
+  if (!Number.isFinite(started) || !Number.isFinite(finished)) {
+    return null;
+  }
+  return Math.max(0, finished - started);
+}
+
+function heartbeatIntervalMs() {
+  const parsed = Number(process.env.EXTERNAL_AGENT_HEARTBEAT_MS);
+  if (!Number.isInteger(parsed) || parsed < 100) {
+    return 30000;
+  }
+  return Math.min(parsed, 300000);
 }
 
 function jobDir(jobId) {

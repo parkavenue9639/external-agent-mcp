@@ -25,6 +25,7 @@ try {
   await initialize(client);
   await assertToolList(client);
   await assertAgentStatus(client);
+  await assertClaudeStreamJsonResult(client);
   const analysisJobId = await assertAnalysisJob(client);
   const patchJobId = await assertSandboxPatchJob(client);
   await assertSearchJobs(client, analysisJobId, patchJobId);
@@ -68,6 +69,17 @@ function writeFakeAgent() {
       "}",
       "const prompt = promptFromArgs();",
       "const wait = prompt.match(/WAIT_(\\d+)/);",
+      "const outputFormatIndex = args.indexOf('--output-format');",
+      "const outputFormat = outputFormatIndex >= 0 ? args[outputFormatIndex + 1] : '';",
+      "if (outputFormat === 'stream-json') {",
+      "  console.log(JSON.stringify({ type: 'system', subtype: 'init' }));",
+      "  if (wait) {",
+      "    await new Promise((resolve) => setTimeout(resolve, Number(wait[1])));",
+      "  }",
+      "  console.log(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'CLAUDE_ASSISTANT_OK' }] } }));",
+      "  console.log(JSON.stringify({ type: 'result', subtype: 'success', result: 'CLAUDE_FINAL_OK' }));",
+      "  process.exit(0);",
+      "}",
       "if (wait) {",
       "  await new Promise((resolve) => setTimeout(resolve, Number(wait[1])));",
       "}",
@@ -131,6 +143,7 @@ function startServer() {
       EXTERNAL_AGENT_ALLOWED_ROOTS: tempRoot,
       EXTERNAL_AGENT_JOB_ROOT: jobRoot,
       EXTERNAL_AGENT_MAX_CONCURRENCY: "2",
+      EXTERNAL_AGENT_HEARTBEAT_MS: "100",
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -238,6 +251,25 @@ async function assertAgentStatus(server) {
     assert.equal(args.includes("--dangerously-skip-permissions"), false);
     assert.equal(args.includes("bypassPermissions"), false);
   }
+}
+
+async function assertClaudeStreamJsonResult(server) {
+  const payload = await callTool(server, "delegate_tasks", {
+    provider: "claude",
+    repo_path: repoPath,
+    mode: "analysis",
+    tasks: ["CLAUDE_STREAM_JSON"],
+    timeout_sec: 5,
+  });
+  const jobId = payload.jobs[0].job_id;
+  const status = await waitForTerminal(server, jobId);
+  assert.equal(status.status, "succeeded");
+  assert.match(status.command.join(" "), /--output-format stream-json/);
+  assert.equal(status.activity.stdout_bytes > 0, true);
+
+  const result = await callTool(server, "job_result", { job_id: jobId });
+  assert.equal(result.jobs[0].result_text, "CLAUDE_FINAL_OK");
+  assert.match(fs.readFileSync(result.jobs[0].logs.stdout, "utf8"), /"type":"result"/);
 }
 
 async function assertAnalysisJob(server) {
@@ -409,6 +441,12 @@ async function assertCancel(server) {
   });
   const jobId = payload.jobs[0].job_id;
   await waitForStatus(server, jobId, "running");
+  await sleep(250);
+  const running = await callTool(server, "job_status", { job_id: jobId, tail_chars: 0 });
+  assert.equal(running.jobs[0].activity.last_event_type, "heartbeat");
+  assert.equal(running.jobs[0].activity.elapsed_ms > 0, true);
+  assert.equal(running.jobs[0].activity.no_output_yet, true);
+  assert.equal(running.jobs[0].activity.stdout_bytes, 0);
   const cancelled = await callTool(server, "cancel_jobs", { job_ids: [jobId] });
   assert.equal(cancelled.jobs[0].cancelled, true);
   const status = await waitForTerminal(server, jobId);

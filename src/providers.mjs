@@ -67,6 +67,7 @@ export const PROVIDERS = {
     binaryEnv: "CLAUDE_BIN",
     defaultBinary: "/opt/homebrew/bin/claude",
     versionArgs: ["--version"],
+    outputFormat: "claude_stream_json",
     capabilities: {
       supports_analysis: true,
       supports_sandbox_patch: true,
@@ -79,7 +80,8 @@ export const PROVIDERS = {
         "--permission-mode",
         mode === "analysis" ? "plan" : "acceptEdits",
         "--output-format",
-        "text",
+        "stream-json",
+        "--include-partial-messages",
       ];
       if (mode === "sandbox_patch") {
         args.push("--allowedTools", "Read,Edit,MultiEdit,Write,Glob,Grep,LS");
