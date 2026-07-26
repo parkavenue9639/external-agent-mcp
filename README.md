@@ -11,9 +11,9 @@ JSON-RPC on stdio.
 
 Initial provider adapters:
 
-- Cursor Agent via `/usr/local/bin/cursor agent --print`
-- Gemini CLI via `/opt/homebrew/bin/gemini --prompt ...`
-- Claude Code via `/opt/homebrew/bin/claude --print`
+- Cursor Agent via `CURSOR_AGENT_BIN`
+- Gemini CLI via `GEMINI_BIN`
+- Claude Code via `CLAUDE_BIN`
 
 Model selection is caller-controlled with the `model` argument. The MCP server
 does not hardcode routing logic such as "simple task uses X, complex task uses
@@ -190,16 +190,16 @@ Add this to `~/.codex/config.toml` or a trusted project `.codex/config.toml`:
 ```toml
 [mcp_servers.external_agent]
 command = "node"
-args = ["/Users/luchong/OpenSourceProject/external-agent-mcp/src/server.mjs"]
+args = ["/path/to/external-agent-mcp/src/server.mjs"]
 startup_timeout_sec = 10
 tool_timeout_sec = 900
 
 [mcp_servers.external_agent.env]
-CURSOR_AGENT_BIN = "/usr/local/bin/cursor"
-GEMINI_BIN = "/opt/homebrew/bin/gemini"
-CLAUDE_BIN = "/opt/homebrew/bin/claude"
+CURSOR_AGENT_BIN = "/path/to/cursor"
+GEMINI_BIN = "/path/to/gemini"
+CLAUDE_BIN = "/path/to/claude"
 RUFF_BIN = "ruff"
-EXTERNAL_AGENT_ALLOWED_ROOTS = "/Users/luchong/Desktop:/Users/luchong/OpenSourceProject"
+EXTERNAL_AGENT_ALLOWED_ROOTS = "/path/to/workspace:/path/to/another-workspace"
 EXTERNAL_AGENT_MAX_CONCURRENCY = "2"
 ```
 
@@ -213,12 +213,12 @@ new tool surface is loaded.
 ```json
 {
   "provider": "cursor",
-  "model": "composer-2.5",
-  "repo_path": "/Users/luchong/Desktop/Agnes_Core",
+  "model": "your-model-name",
+  "repo_path": "/path/to/your-repo",
   "mode": "analysis",
   "tasks": [
-    "Map the agent stream cancellation call path. Return concise findings with file paths.",
-    "Audit prompt/skill dispatch boundaries. Return risks and missing tests."
+    "Map the request lifecycle from the API handler to the service layer. Return concise findings with file paths.",
+    "Audit authentication and permission boundaries. Return risks and missing tests."
   ],
   "timeout_sec": 900
 }
@@ -229,12 +229,12 @@ new tool surface is loaded.
 ```json
 {
   "provider": "claude",
-  "repo_path": "/Users/luchong/Desktop/Agnes_Core",
+  "repo_path": "/path/to/your-repo",
   "mode": "sandbox_patch",
   "tasks": [
     {
       "task": "Fix the focused Ruff SIM102 issue and summarize the patch.",
-      "files": ["services/example/path.py"]
+      "files": ["src/example/path.py"]
     }
   ]
 }
@@ -247,12 +247,12 @@ result, logs, and patch path.
 
 ```json
 {
-  "repo_path": "/Users/luchong/Desktop/Agnes_Core",
+  "repo_path": "/path/to/your-repo",
   "provider": "cursor",
-  "model": "composer-2.5",
+  "model": "your-model-name",
   "mode": "analysis",
   "status": ["succeeded", "failed"],
-  "query": "stream cancellation",
+  "query": "request lifecycle",
   "limit": 20
 }
 ```
@@ -261,8 +261,8 @@ result, logs, and patch path.
 
 ```json
 {
-  "repo_path": "/Users/luchong/Desktop/Agnes_Core",
-  "files": ["services/example/path.py"],
+  "repo_path": "/path/to/your-repo",
+  "files": ["src/example/path.py"],
   "commands": ["ruff_format", "ruff_safe_fix"],
   "timeout_sec": 120,
   "max_changed_files": 10
